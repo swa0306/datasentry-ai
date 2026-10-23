@@ -222,6 +222,13 @@ def _finite(value: object) -> float:
     return number if math.isfinite(number) else 0.0
 
 
+def _sample_std(values: pd.Series) -> float:
+    scale = float(values.abs().max())
+    if scale > math.sqrt(np.finfo(float).max):
+        return _finite((values / scale).std() * scale)
+    return _finite(values.std())
+
+
 def _cache_evidence(analysis_id: str, evidence: dict[str, object]) -> None:
     now = time.monotonic()
     with _cache_lock:
@@ -276,9 +283,7 @@ def _analyze_frame(
             dtype = "empty"
             warnings.append(f"Column '{_clean_text(name)}' contains no values.")
         elif pd.api.types.is_numeric_dtype(series):
-            numeric = pd.to_numeric(series, errors="coerce").replace(
-                [np.inf, -np.inf], np.nan
-            )
+            numeric = series.replace([np.inf, -np.inf], np.nan)
             numeric_data[name] = numeric
         elif pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(
             series
@@ -322,13 +327,15 @@ def _analyze_frame(
         if values.empty:
             continue
 
-        q1 = _finite(values.quantile(0.25))
-        q3 = _finite(values.quantile(0.75))
+        quartiles = values.quantile([0.25, 0.5, 0.75])
+        q1 = _finite(quartiles.loc[0.25])
+        median = _finite(quartiles.loc[0.5])
+        q3 = _finite(quartiles.loc[0.75])
         stats = NumericStatistics(
             count=int(values.count()),
             mean=_finite(values.mean()),
-            median=_finite(values.median()),
-            std_dev=_finite(values.std()) if len(values) > 1 else 0.0,
+            median=median,
+            std_dev=_sample_std(values) if len(values) > 1 else 0.0,
             min=_finite(values.min()),
             max=_finite(values.max()),
             q1=q1,

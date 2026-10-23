@@ -93,10 +93,11 @@ Run backend tests:
 python -m pytest
 ```
 
-Run frontend report tests and production build:
+Run frontend report tests, dashboard/API client tests, and production build:
 
 ```powershell
 npm test
+npm run test:ui
 npm run build
 ```
 
@@ -104,13 +105,15 @@ Latest verification:
 
 | Check | Result |
 |---|---|
-| `python -m pytest -q` | 29 passed, 0 failed, 0 skipped |
+| `python -m pytest -q` | 31 passed, 0 failed, 0 skipped |
 | `npm test` | 3 passed, 0 failed, 0 skipped |
+| `npm run test:ui` | 9 passed, 0 failed |
 | `npm run build` | Passed |
+| `npm audit --audit-level=moderate` | 0 vulnerabilities |
 | `python -m compileall -q backend tests` | Passed |
 | `pip check` | No broken requirements found |
 
-The backend tests use synthetic CSVs and mock Gemini responses; no live Gemini key was used.
+The backend tests use synthetic CSVs and mock Gemini responses; frontend tests cover dashboard rendering, input validation, loading/error/result/history states, and HTTP payloads including timeouts. No live Gemini key was used.
 
 ## Security and limitations
 

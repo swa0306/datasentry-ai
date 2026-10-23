@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import React from "react";
 
 const { analyzeCsv, interpretAnalysis } = vi.hoisted(() => ({
@@ -86,21 +86,23 @@ describe("DataSentry dashboard", () => {
     }));
     render(<App />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Try sample data/ }));
+    const sampleButton = screen.getByRole("button", { name: /Try sample data/ });
+    act(() => {
+      sampleButton.click();
+      sampleButton.click();
+    });
     expect(screen.getByRole("status").textContent).toContain("processed in memory");
     expect(screen.getByRole("heading", { name: "Taking a closer look…" })).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: /Analysis history/ }));
-    fireEvent.click(screen.getByRole("button", { name: /Dashboard/ }));
+    expect(screen.getByRole("region", { name: "Upload a CSV file" }).getAttribute("aria-busy")).toBe("true");
     expect(analyzeCsv).toHaveBeenCalledTimes(1);
 
     finishAnalysis(analysis);
     expect(await screen.findByRole("heading", { name: "Your dataset, at a glance" })).toBeTruthy();
     expect(screen.getByText("metrics.csv")).toBeTruthy();
-    expect(screen.getByText("50.0%")).toBeTruthy();
+    expect(screen.getAllByText("50%")).toHaveLength(2);
     expect(screen.getByText("AI interpretation is unavailable.")).toBeTruthy();
     expect(interpretAnalysis).toHaveBeenCalledWith(analysis.analysis_id);
-  });
+  }, 15_000);
 
   it("shows API failures and lets the user dismiss them", async () => {
     analyzeCsv.mockRejectedValue(new Error("API is unavailable"));

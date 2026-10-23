@@ -153,6 +153,7 @@ def test_extreme_finite_values_return_finite_statistics(client):
     assert response.status_code == 200
     stats = response.json()["numerical_statistics"]["value"]
     assert stats["count"] == 4
+    assert stats["std_dev"] == pytest.approx(8.164965809e307, rel=1e-9)
     assert all(
         value == value and abs(value) != float("inf")
         for value in stats.values()

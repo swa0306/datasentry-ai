@@ -264,6 +264,7 @@ function App() {
             </section>
             <section
               className={`upload-panel ${dragging ? "dragging" : ""}`}
+              aria-busy={busy}
               onDragEnter={(event) => { event.preventDefault(); setDragging(true); }}
               onDragOver={(event) => event.preventDefault()}
               onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }}
