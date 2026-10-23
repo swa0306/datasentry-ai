@@ -1,5 +1,6 @@
 {
     "chat.editor.preferCopilotHarness": false,
     "chat.defaultToCopilotHarness": false,
-    "liveServer.settings.port": 5501
+    "liveServer.settings.port": 5501,
+    "chat.agent.maxRequests": 9999
 }

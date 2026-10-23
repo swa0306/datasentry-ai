@@ -1,4 +1,4 @@
-﻿# Project Plan
+# Project Plan
 
 **Status**: Planning
 **Created**: 2026-10-23
@@ -8,11 +8,11 @@
 
 ## 1. Project Overview
 
-**Goal**: Upgrade the existing DataSentry AI FastAPI backend to enforce verified Firebase Authentication and per-user Firebase Realtime Database history while preserving deterministic in-memory Pandas analysis, optional evidence-grounded Gemini interpretation, and downloadable JSON reports. The project is designed so that every module is independently testable.
+**Goal**: Extend the existing DataSentry AI workspace into a responsive React/Vite dashboard and FastAPI service for secure, in-memory CSV analysis, deterministic Pandas metrics, optional evidence-based Gemini interpretation, and client-side JSON reports. The project is designed so that every module is independently testable.
 
 **App Type**: SPA + API
 
-**API Login**: Yes
+**API Login**: No
 
 **Mode**: AUGMENT
 
@@ -20,7 +20,7 @@
 
 ---
 
-## 2. Backend — Azure Functions
+## 2. Backend — FastAPI API
 
 | Component | Technology |
 |-----------|-----------|
@@ -32,10 +32,6 @@
 | **Test Command** | `python -m pytest` |
 | **Orchestration** | docker-compose |
 
-> **Language vs Runtime**: `Language` is the source language the user picked in this service's `language` question. `Runtime` is the execution runtime — default `Node` for TypeScript/JavaScript, `CPython` for Python, `.NET` for C#. Only deviate from the default (e.g. `Bun`, `Deno`, `PyPy`) when the user explicitly asks. **Package Manager and Test Runner are language-dependent** — match them to this service's Language (e.g. C# → `dotnet (NuGet)` + `xUnit`/`NUnit`/`MSTest`). The `Orchestration` row is recorded for the scaffold step but hidden in the plan UI — always keep it set to `docker-compose`.
-
-This backend remains a FastAPI service with Pydantic validation, bounded CSV intake, and deterministic Pandas analysis. Firebase ID tokens are verified by the backend before any analysis or interpretation request is accepted. Only verified UID-scoped metadata is written to the user's Realtime Database record, and raw CSV content is never persisted.
-
 ---
 
 ## 3. Frontend — Web App
@@ -45,11 +41,9 @@ This backend remains a FastAPI service with Pydantic validation, bounded CSV int
 | **Language** | JavaScript |
 | **Framework** | React + Vite |
 | **Package Manager** | npm |
-| **Test Runner** | vitest |
-| **Mocking Library** | vi.mock |
+| **Test Runner** | Node.js built-in test runner (`node:test`) |
+| **Mocking Library** | Node.js built-in test mocks |
 | **Test Command** | `npm test` |
-
-The planned dashboard is a React + Vite application that signs in users with Firebase email/password auth, preserves browser sessions, and listens only to the signed-in user's history and settings. It sends Firebase ID tokens to the API, renders deterministic and optional AI-backed analysis results, and lets users download JSON report payloads.
 
 ---
 
@@ -57,9 +51,9 @@ The planned dashboard is a React + Vite application that signs in users with Fir
 
 | Azure Service | Role in App | Environment Variable | Default Value (Local) | Classification |
 |---------------|------------|---------------------|----------------------|----------------|
-| Firebase Authentication | Email/password identity and verified tokens for API access | `VITE_FIREBASE_API_KEY` | public Firebase web config | Essential |
-| Firebase Realtime Database | User profile, settings, and per-user analysis metadata | `FIREBASE_DATABASE_URL` | `https://<project-id>-default-rtdb.firebaseio.com` | Essential |
-| Gemini API | Optional evidence-grounded interpretation layer | `GEMINI_API_KEY` | unset; deterministic analysis remains available | Enhancement |
+| Azure App Service | Host the Python FastAPI API | `GEMINI_API_KEY` | Unset; deterministic analysis remains available | Essential |
+| Azure Static Web Apps | Host the React/Vite single-page frontend | `VITE_API_BASE_URL` | `http://localhost:8000` | Essential |
+| Google Gemini API (external) | Optional evidence-grounded explanation of calculated metrics; no CSV rows are sent | `GEMINI_API_KEY`, `GEMINI_MODEL` | Unset; model defaults to `gemini-4-argon` | Enhancement |
 
 ---
 
@@ -70,9 +64,11 @@ The planned dashboard is a React + Vite application that signs in users with Fir
 | Tool | Service(s) | Installed | Version |
 |------|------------|-----------|---------|
 | Python | `datasentry-api` | ✅ | 3.11.9 |
-| pip | `datasentry-api` | ✅ | 24.2 |
-| Node.js | `datasentry-frontend` | ✅ | 22.10.0 |
-| npm | `datasentry-frontend` | ✅ | 10.9.0 |
+| pip | `datasentry-api` | ✅ | 26.2.1 |
+| Uvicorn | `datasentry-api` | ✅ | 0.41.0 |
+| pytest | `datasentry-api` | ✅ | 9.1.1 |
+| Node.js | `datasentry-frontend` | ✅ | 24.13.1 |
+| npm | `datasentry-frontend` | ✅ | 11.8.0 |
 
 ### Debug
 
@@ -80,54 +76,46 @@ The planned dashboard is a React + Vite application that signs in users with Fir
 |------|------------|-----------|---------|
 | Docker | `datasentry-api`, `datasentry-frontend` | ❓ | not confirmed in this sandbox |
 | Docker Compose | `datasentry-api`, `datasentry-frontend` | ❓ | not confirmed in this sandbox |
-| `ms-python.python` | `datasentry-api` | ❓ | not confirmed in this sandbox |
+| `ms-python.python` | `datasentry-api` | ✅ | 2026.10.0 |
+| `ms-vscode.js-debug` | `datasentry-frontend` | ❓ | not confirmed in this sandbox |
 
-Every row resolves to a positive detection or a conservative unknown state. The sandbox does not prove tool absence, so this plan intentionally avoids marking any row as failed. Please double-check all `❓` entries before running the scaffolded app locally.
+Every prerequisite is marked installed only when positively detected; sandbox limitations mean an unknown state is not proof that a tool is absent. Please double-check that all `❓` tools are installed before proceeding.
 
 ---
 
 ## 6. Design System & UI
 
 **Component Library**: Fluent UI v9
-**Style Direction**: Modern analytics workspace with calm indigo actions, teal quality signals, and crisp data-dense cards that emphasize scanability over decoration.
-**Typography**: Segoe UI Variable, Segoe UI, system-ui
+**Style Direction**: A calm, forest-green analytics workspace with clean, data-dense cards, restrained elevation, and clear quality signals. Keep the interface approachable and privacy-conscious, with teal-green actions and warm amber reserved for potential anomalies.
+**Typography**: DM Sans, Manrope, system-ui
 
 ### Color Palette
 
 | Token | Hex | Usage |
 |-------|-----|-------|
-| `primary` | `#3B82F6` | Primary actions, navigation highlights, and focused analysis states |
-| `accent` | `#14B8A6` | Success indicators, quality badges, and key trend highlights |
-| `surface` | `#F5F7FB` | Main page and panel backgrounds |
-| `text` | `#111827` | Main content text, metrics, and dataset names |
-| `muted` | `#64748B` | Secondary labels, timestamps, and helper text |
-| `border` | `#E2E8F0` | Dividers, inputs, and card borders |
+| `primary` | `#147B64` | DataSentry actions, active dashboard navigation, and links |
+| `accent` | `#D98A35` | Potential-anomaly counts and attention cues in analysis results |
+| `surface` | `#F6F8F7` | Dashboard canvas behind upload and analysis panels |
+| `text` | `#1D302D` | Dataset names, metric values, and explanatory copy |
+| `muted` | `#70827A` | Column metadata, timestamps, and secondary guidance |
+| `border` | `#E1EAE5` | CSV upload boundary, result cards, and table dividers |
 
 ### Pages
 
 | Page | Route | Purpose | Layout |
 |------|-------|---------|--------|
-| Dashboard | `/` | Review the latest uploaded dataset, quality signals, and the next action. | `header, nav, sidebar, hero, form, grid, table, footer` |
-| History | `/history` | Review saved analyses, statuses, and downloadable JSON reports. | `header, nav, sidebar, table, actions, footer` |
-| Settings | `/settings` | Manage the signed-in user profile, default export preferences, and notification rules. | `header, nav, sidebar, form, table, footer` |
+| Dashboard | `/` | Upload a CSV, review its calculated quality and statistical signals, and download the resulting JSON report. | `header, nav, hero, form, grid, table, actions, footer` |
 
 ### Sample Content
 
-Dashboard — analyzed datasets:
-| File | Rows | Columns | Status |
-|-------|------|---------|--------|
-| `retail_orders_q3.csv` | 1,248 | 8 | `complete` |
-| `subscription_churn.csv` | 864 | 11 | `complete` |
-| `regional_sales.csv` | 2,405 | 9 | `warning` |
+Dashboard — sample CSV rows from `weekly-business-metrics.csv`:
+| Week | Visits | Revenue | Region |
+|------|--------|---------|--------|
+| Week 1 | 820 | $16,400 | North |
+| Week 7 | Missing | $21,400 | North |
+| Week 20 | 9,000 (potential outlier) | $180,000 | East |
 
-History — analysis records:
-| Analysis | Rows | Quality | Status |
-|----------|------|---------|--------|
-| `retail_orders_q3.csv` | 1,248 | 96.8% | completed |
-| `subscription_churn.csv` | 864 | 98.1% | completed |
-| `regional_sales.csv` | 2,405 | 99.2% | completed |
-
-Settings — user defaults: theme: system · export: JSON · alerts: email summary
+Dashboard — analysis summary: 24 rows · 5 columns · 1 missing `visits` value · possible IQR outlier at Week 20. Gemini interpretation: optional and unavailable until a backend key is configured.
 
 ---
 
@@ -140,21 +128,23 @@ project-root/
 │   └── .preview-temp/
 │       ├── theme.css
 │       ├── manifest.json
-│       ├── dashboard.html
-│       ├── history.html
-│       └── settings.html
+│       └── dashboard.html
 ├── backend/
-│   ├── main.py
-│   ├── services/
-│   ├── tests/
-│   └── __init__.py
+│   ├── __init__.py
+│   └── main.py
+├── src/
+│   ├── App.jsx
+│   ├── api.js
+│   ├── dashboard.css
+│   ├── main.jsx
+│   └── report.js
+├── tests/
+│   ├── report.test.js
+│   └── test_backend.py
 ├── .env.example
-├── .gitignore
-├── database.rules.json
-├── firebase.json
-├── README.md
-├── requirements.txt
-└── package.json
+├── index.html
+├── package.json
+└── requirements.txt
 ```
 
 ---
@@ -163,9 +153,9 @@ project-root/
 
 | # | Method | Path | Description | Request Body | Response Body | Status Codes |
 |---|--------|------|-------------|-------------|--------------|-------------|
-| 1 | GET | `/api/health` | Public health check for the API | — | `{ status, services }` | 200, 503 |
-| 2 | POST | `/api/analyze` | Verify Firebase bearer token, validate bounded CSV input, run deterministic analysis, and write per-user history metadata | `multipart/form-data` file plus `Authorization: Bearer <id-token>` | `{ analysis_id, file_name, row_count, column_count, warnings, processing_time_ms }` | 200, 400, 401, 413, 422, 503 |
-| 3 | POST | `/api/interpret` | Verify token and scoped evidence; optionally enrich with Gemini-backed interpretation | `{ analysis_id }` plus `Authorization: Bearer <id-token>` | `{ available, status, interpretation, message, processing_time_ms }` | 200, 401, 404, 422, 503, 504 |
+| 1 | GET | `/health` | Confirm that the API process is responding | — | `{ status, service }` | 200 |
+| 2 | POST | `/api/analyze` | Validate a bounded CSV and return deterministic metrics, quality signals, and a short-lived analysis ID | `multipart/form-data` with `file` | `{ analysis_id, file_name, row_count, column_count, columns, numerical_statistics, correlations, potential_anomalies, warnings, processing_time_ms }` | 200, 400, 413, 415, 422 |
+| 3 | POST | `/api/interpret` | Optionally interpret the cached calculated evidence with Gemini; return a graceful unavailable result when the provider cannot be used | `{ analysis_id }` | `{ available, status, interpretation, message, processing_time_ms }` | 200, 404, 422 |
 
 ---
 

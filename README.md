@@ -1,82 +1,129 @@
 # DataSentry AI
 
-DataSentry AI analyzes bounded CSV uploads in memory with Pandas, returns deterministic data-quality and numerical statistics, and optionally adds evidence-grounded Gemini interpretation. Firebase Authentication protects API operations, and Firebase Realtime Database stores only per-user profiles/settings and analysis-history metadata. Raw CSV contents are not persisted or uploaded to Firebase Storage.
+DataSentry AI helps students, small businesses, and organizations turn CSVs into understandable, evidence-based reports. It combines deterministic Python/Pandas analysis with optional Gemini explanations; it is an analysis tool, not a generic chatbot.
 
-## Local application
+## What works
 
-The React/Vite frontend runs from the repository root; FastAPI is `backend/main.py`. Firebase Authentication and Realtime Database must be configured in Firebase Console before sign-in and protected analysis can work. This repository does not include real Firebase credentials.
+- Bounded CSV upload with server-side extension, encoding, header, row, column, and structure validation.
+- Deterministic missing-value, duplicate-row, numerical, categorical, Pearson correlation, and potential-outlier analysis.
+- Tukey's 1.5×IQR rule for potential anomalies; statistical flags are not confirmed errors or fraud.
+- Categorical summaries include unique counts and anonymized top-category frequencies; raw category labels and source rows are not returned.
+- Optional Google Gemini interpretation of calculated evidence, with validated JSON output and graceful fallback.
+- Responsive dark dashboard with measured metrics, charts, quality warnings, loading/error/empty states, session-only analysis history, and downloadable JSON reports.
+- Uploads are processed in memory. The backend retains only bounded calculated evidence in a short-lived process cache so `/api/interpret` can use server-computed results; it does not persist uploaded files.
 
-## Backend setup
+There is no user login, database, Firebase dependency, or permanent analysis history in this prototype. The recent-history view holds calculated results in browser memory for the current page session only; refreshing or closing the page clears it.
 
-1. Create a Firebase project and enable **Authentication → Email/Password**.
-2. Create a **Realtime Database** and copy its database URL.
-3. Configure the Realtime Database rules from [`database.rules.json`](./database.rules.json). Deploy them with the Firebase CLI after selecting your project:
+## Architecture
 
-   ```powershell
-   firebase use <your-project-id>
-   firebase deploy --only database
-   ```
-
-4. Create a backend service account with the minimum Firebase Admin access needed for ID-token verification and Realtime Database writes. For local development, store its JSON file outside the repository and set `FIREBASE_SERVICE_ACCOUNT` to its absolute path. Production should use the hosting platform's Application Default Credentials / workload identity instead of a downloaded key.
-5. Copy `.env.example` to `.env`, set `FIREBASE_DATABASE_URL`, and configure `FIREBASE_SERVICE_ACCOUNT` or the platform's ADC. Set `GEMINI_API_KEY` only on the backend if AI interpretation is wanted. Never put a service-account key or Gemini key in a `VITE_*` variable.
-6. Install the Python dependencies and run the API:
-
-   ```powershell
-   python -m pip install -r requirements.txt
-   uvicorn backend.main:app --reload
-   ```
-
-   `GET /health` is public. `POST /api/analyze` and `POST /api/interpret` require `Authorization: Bearer <Firebase ID token>`. The API derives the UID from the verified token; it does not accept a caller-supplied UID. Analysis metadata is written only after successful CSV validation and analysis to `analysisHistory/{uid}/{analysisId}`. A failed metadata write returns a service error rather than claiming that history was saved.
-
-## Realtime Database data and access
-
-The intended JSON shape is:
-
-```json
-{
-  "users": {
-    "{uid}": {
-      "profile": {
-        "displayName": "Example User",
-        "email": "user@example.com"
-      },
-      "settings": {
-        "theme": "system",
-        "compactMode": false
-      }
-    }
-  },
-  "analysisHistory": {
-    "{uid}": {
-      "{analysisId}": {
-        "filename": "orders.csv",
-        "rowCount": 120,
-        "columnCount": 8,
-        "missingValues": 4,
-        "status": "completed",
-        "createdAt": 1792713600000
-      }
-    }
-  }
-}
+```text
+React + Vite browser
+  ├── POST /api/analyze (CSV multipart upload)
+  ├── POST /api/interpret (short-lived analysis ID)
+  └── download JSON report locally
+             │
+FastAPI + Pydantic
+  ├── CSV validation and resource limits
+  ├── Pandas deterministic analysis
+  └── Optional Google Gemini API (server-side only)
 ```
 
-The rules deny access by default, scope profile/settings and history reads to `auth.uid`, validate allowed profile/settings/metadata fields, and deny client writes to analysis history. The Admin SDK bypasses rules for server writes. Do not loosen rules to public reads/writes. Firebase's local emulator can be added when an actual frontend integration needs an isolated end-to-end test; these files alone do not establish a live Firebase connection.
+Deterministic metrics are calculated by Pandas. Gemini receives a compact summary of those results—not the uploaded CSV—and only explains them. Dataset-derived values are treated as untrusted input, and validated AI output is presented as advisory. Gemini's current model setting defaults to `gemini-4-argon`, listed in the [official Gemini models documentation](https://ai.google.dev/gemini-api/docs/latest-model); override it with `GEMINI_MODEL` if needed.
 
-## React/Vite Firebase integration
+## Requirements
 
-The frontend uses Firebase email/password authentication, persistent local sessions, and the signed-in user's Firebase ID token for authenticated API calls. The FastAPI backend scopes Realtime Database history access to the UID in the verified token. Never expose Firebase Admin credentials or `GEMINI_API_KEY` to the browser.
+- Python 3.10+
+- Node.js 20+
+- A Gemini API key is optional. Without it, deterministic analysis and report export still work.
 
-## CSV and AI behavior
+## Setup
 
-The backend limits uploads by byte size, row count, and column count; checks extension, UTF-8 text, headers, duplicate names, and CSV structure; and analyzes uploads in memory. It retains only bounded calculated evidence in a short-lived, UID-scoped process cache for `/api/interpret`. Gemini receives calculated evidence, not the uploaded CSV. Invalid, unavailable, or timed-out AI output degrades to an explicit unavailable response while deterministic analysis remains usable.
+From the workspace root, create a local environment file:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Install the Python dependencies and start the backend:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+uvicorn backend.main:app --reload
+```
+
+In a second terminal, install and start the frontend:
+
+```powershell
+npm install
+npm run dev
+```
+
+Open the Vite URL printed by the dev server (normally `http://localhost:5173`). The API is normally at `http://localhost:8000`; `VITE_API_BASE_URL` can override the browser's API URL. Set `GEMINI_API_KEY` in the backend environment to enable AI interpretation. Never use a `VITE_` variable for the Gemini key.
+
+## API
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/health` | Backend health check |
+| `POST` | `/api/analyze` | Validate and analyze one CSV; send multipart field `file` |
+| `POST` | `/api/interpret` | Optional interpretation; send `{"analysis_id":"..."}` |
+
+`/api/analyze` returns a random analysis ID and calculated analysis. A bounded in-memory cache keeps the corresponding compact evidence for up to 30 minutes (and at most 100 analyses) for `/api/interpret`. Restarting the process clears it. The frontend builds the JSON report from returned analysis and interpretation; there is no persistent report endpoint.
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | unset | Backend-only Gemini API key |
+| `GEMINI_MODEL` | `gemini-4-argon` | Gemini model name |
+| `MAX_UPLOAD_BYTES` | `5242880` | Maximum CSV body size (5 MiB) |
+| `MAX_ROWS` | `50000` | Maximum data rows |
+| `MAX_COLUMNS` | `100` | Maximum columns |
+| `AI_TIMEOUT_SECONDS` | `20` | Maximum wait for Gemini |
+| `FRONTEND_ORIGINS` | localhost Vite origins | Comma-separated allowed browser origins |
+| `VITE_API_BASE_URL` | `http://localhost:8000` | API origin used by the frontend |
 
 ## Tests
 
-Run backend tests with:
+Run backend tests:
 
 ```powershell
 python -m pytest
 ```
 
-The tests mock Firebase and Gemini external calls. No live Firebase connection is required for the test suite. Run `npm run build` to verify the frontend production bundle.
+Run frontend report tests and production build:
+
+```powershell
+npm test
+npm run build
+```
+
+Latest verification:
+
+| Check | Result |
+|---|---|
+| `python -m pytest -q` | 29 passed, 0 failed, 0 skipped |
+| `npm test` | 3 passed, 0 failed, 0 skipped |
+| `npm run build` | Passed |
+| `python -m compileall -q backend tests` | Passed |
+| `pip check` | No broken requirements found |
+
+The backend tests use synthetic CSVs and mock Gemini responses; no live Gemini key was used.
+
+## Security and limitations
+
+- Uploaded files are size-, row-, and column-limited; CSV parsing is strict, and content is never executed.
+- Secrets are read only by the backend; `.env` and local credentials are ignored by Git.
+- CORS is restricted to configured frontend origins. Use HTTPS and configure the deployed frontend origin for production.
+- AI output is schema-validated and treated as untrusted advisory text. Data-derived evidence is cached in process memory for interpretation; it is not encrypted at rest because it is not written to disk.
+- This prototype has no authentication or per-user isolation. Do not expose it as a public multi-tenant service without adding real authentication, quotas/rate limits, and tenant-scoped analysis storage.
+- CSV downloads are unavailable as a feature; reports export analysis JSON only and do not include source rows.
+
+## Demo flow
+
+1. Start the backend and Vite frontend.
+2. On the dashboard, choose a CSV or select **Try sample data**.
+3. Review the dataset summary, quality signals, statistics, correlations, anomalies, and AI availability.
+4. Select **Download JSON** to export the calculated results and any validated interpretation.

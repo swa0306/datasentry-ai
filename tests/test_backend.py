@@ -1,308 +1,351 @@
 from __future__ import annotations
 
 import json
+import time
 from unittest.mock import Mock
 
-import pandas as pd
 import pytest
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from backend import main
 
 
 @pytest.fixture
-def client(monkeypatch):
-    monkeypatch.setattr(main, "_persist_analysis_metadata", lambda uid, result: None)
-    main.app.dependency_overrides[main._current_user] = lambda: "firebase-user-1"
+def client():
     with TestClient(main.app) as test_client:
         yield test_client
-    main.app.dependency_overrides.clear()
     with main._cache_lock:
         main._analysis_cache.clear()
 
 
-def test_analyze_frame_returns_numerical_statistics():
-    frame = pd.DataFrame({"amount": [1, 2, 3, 100], "units": [2, 3, 4, 5]})
-
-    analysis, _ = main._analyze_frame(frame, "orders.csv", 1.0)
-
-    assert analysis.row_count == 4
-    assert analysis.numerical_statistics["amount"].mean == 26.5
-    assert analysis.numerical_statistics["amount"].median == 2.5
-    assert analysis.potential_anomalies["amount"].outlier_count == 1
-
-
-def test_analyze_rejects_duplicate_headers(client):
-    response = client.post(
+def upload(client, name="metrics.csv", contents=b"amount,units\n1,2\n2,3\n"):
+    return client.post(
         "/api/analyze",
-        files={"file": ("duplicate.csv", b"amount,amount\n1,2\n", "text/csv")},
+        files={"file": (name, contents, "application/octet-stream")},
     )
+
+
+def analyze_for_interpret(client):
+    response = upload(client)
+    assert response.status_code == 200
+    return response.json()["analysis_id"]
+
+
+def test_health_check_is_available(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "service": "datasentry-api"}
+
+
+def test_valid_csv_returns_deterministic_analysis(client):
+    response = upload(client, contents=b"amount,units\n10,1\n20,2\n30,3\n")
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["row_count"] == 3
+    assert result["column_count"] == 2
+    assert result["numerical_statistics"]["amount"]["mean"] == 20
+    assert result["processing_time_ms"] >= 0
+    assert result["analysis_id"]
+
+
+@pytest.mark.parametrize(
+    ("contents", "code"),
+    [
+        (b"", "empty_file"),
+        (b"amount,units\n", "no_data_rows"),
+        (b'amount,units\n1,"unfinished\n', "invalid_csv"),
+        (b"amount,amount\n1,2\n", "duplicate_headers"),
+        (b"a" * 121 + b"\n1\n", "invalid_header"),
+        (b"\xff\xfe", "invalid_encoding"),
+    ],
+)
+def test_csv_validation_errors_are_structured(client, contents, code):
+    response = upload(client, contents=contents)
 
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "duplicate_headers"
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["message"]
 
 
-def test_analyze_rejects_upload_over_limit(client, monkeypatch):
+def test_unsupported_file_type_is_rejected(client):
+    response = upload(client, name="metrics.txt")
+
+    assert response.status_code == 415
+    assert response.json()["error"]["code"] == "unsupported_file_type"
+
+
+def test_oversized_upload_is_rejected(client, monkeypatch):
     monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 4)
 
-    response = client.post(
-        "/api/analyze",
-        files={"file": ("large.csv", b"value\n123\n", "text/csv")},
-    )
+    response = upload(client, contents=b"value\n123\n")
 
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "file_too_large"
 
 
-def test_analyze_persists_metadata_after_success(client, monkeypatch):
-    persist = Mock()
-    monkeypatch.setattr(main, "_persist_analysis_metadata", persist)
+def test_request_body_limit_rejects_large_multipart_envelope(
+    client, monkeypatch
+):
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 4)
+    response = upload(client, contents=b"value\n" + b"x" * (65 * 1024))
 
-    response = client.post(
-        "/api/analyze",
-        files={"file": ("orders.csv", b"amount,units\n10,1\n20,2\n", "text/csv")},
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "file_too_large"
+
+
+def test_row_and_column_limits_are_enforced(client, monkeypatch):
+    monkeypatch.setattr(main, "MAX_ROWS", 2)
+    too_many_rows = upload(client, contents=b"value\n1\n2\n3\n")
+    assert too_many_rows.status_code == 413
+    assert too_many_rows.json()["error"]["code"] == "too_many_rows"
+
+    monkeypatch.setattr(main, "MAX_COLUMNS", 1)
+    too_many_columns = upload(client, contents=b"left,right\n1,2\n")
+    assert too_many_columns.status_code == 413
+    assert too_many_columns.json()["error"]["code"] == "too_many_columns"
+
+
+def test_missing_values_and_duplicate_rows_are_counted(client):
+    response = upload(
+        client,
+        contents=b"amount,region\n10,west\n,west\n10,west\n",
+    )
+
+    result = response.json()
+    assert result["columns"][0]["missing_count"] == 1
+    assert result["columns"][0]["missing_percent"] == pytest.approx(33.33)
+    assert result["duplicate_rows"] == 1
+
+
+def test_numerical_statistics_are_calculated(client):
+    response = upload(client, contents=b"amount\n1\n2\n3\n100\n")
+
+    stats = response.json()["numerical_statistics"]["amount"]
+    assert stats["mean"] == 26.5
+    assert stats["median"] == 2.5
+    assert stats["min"] == 1
+    assert stats["max"] == 100
+
+
+def test_constant_numeric_column_and_missing_values_are_stable(client):
+    response = upload(
+        client,
+        contents=b"constant,measurement\n5,1\n5,2\n5,\n5,4\n",
     )
 
     assert response.status_code == 200
     result = response.json()
-    persist.assert_called_once()
-    uid, analysis = persist.call_args.args
-    assert uid == "firebase-user-1"
-    assert analysis.analysis_id == result["analysis_id"]
+    assert result["columns"][1]["missing_count"] == 1
+    assert result["numerical_statistics"]["constant"]["std_dev"] == 0
+    assert result["numerical_statistics"]["constant"]["mean"] == 5
+    assert result["potential_anomalies"] == {}
+    assert result["correlations"] == []
 
 
-def test_failed_analysis_does_not_persist_metadata(client, monkeypatch):
-    persist = Mock()
-    monkeypatch.setattr(main, "_persist_analysis_metadata", persist)
-
-    response = client.post(
-        "/api/analyze",
-        files={"file": ("bad.csv", b"amount,amount\n1,2\n", "text/csv")},
+def test_extreme_finite_values_return_finite_statistics(client):
+    response = upload(
+        client,
+        contents=b"value\n1e308\n-1e308\n1\n2\n",
     )
 
-    assert response.status_code == 400
-    persist.assert_not_called()
+    assert response.status_code == 200
+    stats = response.json()["numerical_statistics"]["value"]
+    assert stats["count"] == 4
+    assert all(
+        value == value and abs(value) != float("inf")
+        for value in stats.values()
+    )
 
 
-def test_failed_history_write_is_reported_and_evidence_is_not_cached(
+def test_iqr_anomaly_is_reported_as_potential(client):
+    response = upload(client, contents=b"amount\n1\n2\n3\n4\n5\n100\n")
+
+    anomaly = response.json()["potential_anomalies"]["amount"]
+    assert anomaly["method"].startswith("Tukey IQR rule")
+    assert anomaly["outlier_count"] == 1
+    assert anomaly["examples"][0]["value"] == 100
+
+
+def test_dataset_without_numeric_columns_does_not_fail(client):
+    response = upload(
+        client,
+        contents=b"region,status\nwest,active\neast,inactive\nwest,active\n",
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["numerical_statistics"] == {}
+    assert result["correlations"] == []
+    assert result["categorical_summaries"]["region"]["unique_count"] == 2
+    assert result["categorical_summaries"]["region"]["top_value_counts"] == [2, 1]
+
+
+def test_empty_column_is_handled(client):
+    response = upload(client, contents=b"region,unused\nwest,\neast,\n")
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["columns"][1]["dtype"] == "empty"
+    assert result["columns"][1]["missing_count"] == 2
+
+
+def test_interpretation_gracefully_handles_missing_key(client, monkeypatch):
+    analysis_id = analyze_for_interpret(client)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    response = client.post("/api/interpret", json={"analysis_id": analysis_id})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+    assert "GEMINI_API_KEY" in response.json()["message"]
+
+
+def test_interpretation_gracefully_handles_invalid_model_configuration(
     client, monkeypatch
 ):
-    monkeypatch.setattr(
-        main,
-        "_persist_analysis_metadata",
-        Mock(side_effect=RuntimeError("database unavailable")),
-    )
+    analysis_id = analyze_for_interpret(client)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_MODEL", "m" * 101)
 
-    response = client.post(
-        "/api/analyze",
-        files={"file": ("orders.csv", b"amount\n10\n20\n", "text/csv")},
-    )
+    response = client.post("/api/interpret", json={"analysis_id": analysis_id})
 
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "history_unavailable"
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+    assert "configuration is invalid" in response.json()["message"]
+    assert "deterministic analysis is still available" in response.json()["message"]
 
 
-def test_analysis_evidence_is_scoped_to_authenticated_uid():
-    analysis_id = "23d8ebda-f6a0-4e5d-9c38-4fa2a130ed98"
-    evidence = {"row_count": 1}
-    main._cache_evidence("owner", analysis_id, evidence)
-
-    assert main._get_evidence("owner", analysis_id) == evidence
-    assert main._get_evidence("other-user", analysis_id) is None
-
-
-def test_missing_bearer_token_is_rejected():
-    with pytest.raises(HTTPException) as exc:
-        main._current_user(None)
-
-    assert exc.value.status_code == 401
-
-
-def test_firebase_token_uid_is_used_not_client_supplied_uid(monkeypatch):
-    monkeypatch.setattr(
-        main, "_verify_firebase_id_token", lambda token: {"uid": "verified-user"}
-    )
-
-    assert main._current_user("Bearer valid-token") == "verified-user"
-
-
-def test_firebase_id_token_verification_checks_revocation(monkeypatch):
-    application = object()
-    verify = Mock(return_value={"uid": "verified-user"})
-    monkeypatch.setattr(main, "_firebase_application", lambda: application)
-    monkeypatch.setattr(main.firebase_auth, "verify_id_token", verify)
-
-    assert main._verify_firebase_id_token("signed-token") == {
-        "uid": "verified-user"
-    }
-    verify.assert_called_once_with(
-        "signed-token", app=application, check_revoked=True
-    )
-
-
-def test_invalid_firebase_token_is_rejected(monkeypatch):
-    def reject_token(_token):
-        raise main._error(401, "invalid_token", "invalid")
-
-    monkeypatch.setattr(main, "_verify_firebase_id_token", reject_token)
-
-    with pytest.raises(HTTPException) as exc:
-        main._current_user("Bearer invalid-token")
-
-    assert exc.value.status_code == 401
-
-
-def test_interpret_returns_unavailable_when_gemini_fails(client, monkeypatch):
-    analysis_id = "23d8ebda-f6a0-4e5d-9c38-4fa2a130ed98"
-    main._cache_evidence("firebase-user-1", analysis_id, {"row_count": 10})
+def test_interpretation_gracefully_handles_provider_failure(client, monkeypatch):
+    analysis_id = analyze_for_interpret(client)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(
-        main,
-        "_generate_interpretation",
-        Mock(side_effect=RuntimeError("provider unavailable")),
+        main, "_generate_interpretation", Mock(side_effect=RuntimeError("provider failed"))
     )
 
     response = client.post("/api/interpret", json={"analysis_id": analysis_id})
 
     assert response.status_code == 200
     assert response.json()["status"] == "unavailable"
-    assert response.json()["interpretation"] is None
+    assert "deterministic analysis" in response.json()["message"]
 
 
-def test_interpret_cannot_access_another_users_analysis(client):
-    analysis_id = "23d8ebda-f6a0-4e5d-9c38-4fa2a130ed98"
-    main._cache_evidence("different-user", analysis_id, {"row_count": 10})
+def test_interpretation_validates_and_returns_structured_gemini_output(
+    client, monkeypatch
+):
+    analysis_id = analyze_for_interpret(client)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_MODEL", "")
+    output = {
+        "executive_summary": "The metrics rise across the observed rows.",
+        "key_findings": ["The two numeric fields move together."],
+        "potential_risks": ["A statistical outlier may merit review."],
+        "recommendations": ["Check the source of the flagged value."],
+        "limitations": ["Correlation does not show causation."],
+    }
+    model_api = Mock()
+    model_api.generate_content.return_value = Mock(
+        text=json.dumps(output)
+    )
+    client_instance = Mock(models=model_api)
+    client_factory = Mock(return_value=client_instance)
+    monkeypatch.setattr(main.genai, "Client", client_factory)
 
     response = client.post("/api/interpret", json={"analysis_id": analysis_id})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "available"
+    assert response.json()["interpretation"] == output
+    assert client_factory.call_args.kwargs["api_key"] == "test-key"
+    model_api.generate_content.assert_called_once()
+    assert model_api.generate_content.call_args.kwargs["model"] == "gemini-4-argon"
+
+
+@pytest.mark.parametrize(
+    "provider_text",
+    [
+        "not json",
+        '{"executive_summary":"Only one field"}',
+    ],
+)
+def test_invalid_gemini_responses_degrade_gracefully(client, monkeypatch, provider_text):
+    analysis_id = analyze_for_interpret(client)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    generated = Mock(text=provider_text)
+    model_api = Mock()
+    model_api.generate_content.return_value = generated
+    monkeypatch.setattr(main.genai, "Client", Mock(return_value=Mock(models=model_api)))
+
+    response = client.post("/api/interpret", json={"analysis_id": analysis_id})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+
+
+def test_interpretation_timeout_preserves_analysis(client, monkeypatch):
+    analysis_id = analyze_for_interpret(client)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(main, "AI_TIMEOUT_SECONDS", 0.01)
+
+    def slow_provider(_evidence):
+        time.sleep(0.05)
+        raise RuntimeError("provider timeout")
+
+    monkeypatch.setattr(main, "_generate_interpretation", slow_provider)
+    response = client.post("/api/interpret", json={"analysis_id": analysis_id})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "unavailable"
+    assert "timed out" in response.json()["message"]
+
+
+def test_interpretation_cannot_access_expired_analysis(client):
+    response = client.post(
+        "/api/interpret",
+        json={"analysis_id": "23d8ebda-f6a0-4e5d-9c38-4fa2a130ed98"},
+    )
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "analysis_expired"
 
 
-def test_analysis_route_requires_a_bearer_token():
-    with TestClient(main.app) as unauthenticated_client:
-        response = unauthenticated_client.post(
-            "/api/analyze",
-            files={"file": ("data.csv", b"value\n1\n", "text/csv")},
-        )
-
-    assert response.status_code == 401
-
-
-def test_health_remains_public_and_available(client):
-    response = client.get("/health")
-
-    assert response.status_code == 200
-    assert response.json()["status"] == "ok"
-
-
-def test_authenticated_identity_endpoint_returns_verified_uid(client):
-    response = client.get("/api/auth/me")
-
-    assert response.status_code == 200
-    assert response.json() == {"uid": "firebase-user-1"}
-
-
-def test_history_endpoint_returns_user_scoped_records_in_newest_order(
-    client, monkeypatch
-):
-    records = {
-        "older-id": {
-            "filename": "older.csv",
-            "rowCount": 10,
-            "columnCount": 2,
-            "missingValues": 1,
-            "status": "completed",
-            "createdAt": 100,
-        },
-        "newer-id": {
-            "filename": "newer.csv",
-            "rowCount": 20,
-            "columnCount": 3,
-            "missingValues": 2,
-            "status": "completed",
-            "createdAt": 200,
-        },
-    }
-    reference = Mock()
-    reference.get.return_value = records
-    monkeypatch.setattr(main, "_firebase_application", lambda: object())
-    monkeypatch.setattr(main.firebase_db, "reference", Mock(return_value=reference))
-
-    response = client.get("/api/history")
-
-    assert response.status_code == 200
-    assert [record["analysis_id"] for record in response.json()] == [
-        "newer-id",
-        "older-id",
-    ]
-    main.firebase_db.reference.assert_called_once_with(
-        "/analysisHistory/firebase-user-1", app=main.firebase_db.reference.call_args.kwargs["app"]
+def test_correlation_is_returned_from_calculated_numeric_columns(client):
+    response = upload(
+        client,
+        contents=b"visits,revenue\n1,10\n2,20\n3,30\n4,40\n",
     )
 
-
-def test_history_endpoint_reports_database_failures(client, monkeypatch):
-    reference = Mock()
-    reference.get.side_effect = RuntimeError("database unavailable")
-    monkeypatch.setattr(main, "_firebase_application", lambda: object())
-    monkeypatch.setattr(main.firebase_db, "reference", Mock(return_value=reference))
-
-    response = client.get("/api/history")
-
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "history_unavailable"
+    correlation = response.json()["correlations"][0]
+    assert correlation["value"] == 1.0
+    assert {correlation["column_a"], correlation["column_b"]} == {"visits", "revenue"}
 
 
-def test_cors_allows_authorization_header_for_frontend(client):
-    response = client.options(
-        "/api/analyze",
-        headers={
-            "Origin": "http://localhost:5173",
-            "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "authorization,content-type",
-        },
+def test_analysis_does_not_echo_uploaded_cell_contents(client):
+    response = upload(
+        client,
+        contents=b"secret,amount\nprivate-customer-name,10\nanother-name,20\n",
     )
 
     assert response.status_code == 200
-    assert "authorization" in response.headers["access-control-allow-headers"].lower()
+    assert "private-customer-name" not in response.text
+    assert "another-name" not in response.text
 
 
-def test_analysis_metadata_contains_no_csv_contents(monkeypatch):
-    reference = Mock()
-    monkeypatch.setattr(main, "_firebase_application", lambda: object())
-    monkeypatch.setattr(main.firebase_db, "reference", Mock(return_value=reference))
-    analysis = main.Analysis(
-        analysis_id="23d8ebda-f6a0-4e5d-9c38-4fa2a130ed98",
-        file_name="orders.csv",
-        analyzed_at="2026-10-23T00:00:00+00:00",
-        row_count=3,
-        column_count=2,
-        duplicate_rows=0,
-        columns=[
-            main.ColumnQuality(
-                name="amount", missing_count=1, missing_percent=33.33, dtype="int64"
-            )
-        ],
-        numerical_statistics={},
-        categorical_summaries={},
-        correlations=[],
-        potential_anomalies={},
-        warnings=[],
-        processing_time_ms=1.0,
+def test_ai_evidence_contains_aggregates_not_categorical_cell_values():
+    frame = main.pd.DataFrame(
+        {"customer": ["sensitive-name-1", "sensitive-name-2"], "amount": [10, 20]}
     )
 
-    main._persist_analysis_metadata("uid-1", analysis)
+    _, evidence = main._analyze_frame(frame, "private.csv", 1.0)
 
-    path, = main.firebase_db.reference.call_args.args
-    assert path == f"/analysisHistory/uid-1/{analysis.analysis_id}"
-    metadata = reference.set.call_args.args[0]
-    assert metadata == {
-        "filename": "orders.csv",
-        "rowCount": 3,
-        "columnCount": 2,
-        "missingValues": 1,
-        "status": "completed",
-        "createdAt": 1792713600000,
-    }
-    assert "contents" not in json.dumps(metadata)
+    assert "sensitive-name-1" not in json.dumps(evidence)
+    assert "sensitive-name-2" not in json.dumps(evidence)
+    assert evidence["row_count"] == 2
+
+
+def test_invalid_interpret_request_has_safe_error_shape(client):
+    response = client.post("/api/interpret", json={"analysis_id": "bad"})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"

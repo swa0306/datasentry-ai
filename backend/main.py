@@ -19,11 +19,13 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import JSONResponse
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -67,7 +69,7 @@ class NumericStatistics(BaseModel):
 
 class CategoricalSummary(BaseModel):
     unique_count: int
-    top_values: list[dict[str, int | str]]
+    top_value_counts: list[int]
 
 
 class Anomaly(BaseModel):
@@ -125,6 +127,77 @@ class InterpretResponse(BaseModel):
     interpretation: Interpretation | None = None
     message: str | None = None
     processing_time_ms: float
+
+
+class RequestBodyTooLarge(Exception):
+    pass
+
+
+class GeminiConfigurationError(Exception):
+    pass
+
+
+class UploadSizeLimitMiddleware:
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/api/analyze"
+        ):
+            await self.application(scope, receive, send)
+            return
+
+        max_body_bytes = MAX_UPLOAD_BYTES + 64 * 1024
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length")
+        if content_length:
+            try:
+                if int(content_length) > max_body_bytes:
+                    await self._reject(scope, receive, send)
+                    return
+            except ValueError:
+                await self._reject(scope, receive, send)
+                return
+
+        received = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > max_body_bytes:
+                    raise RequestBodyTooLarge
+            return message
+
+        async def tracked_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.application(scope, limited_receive, tracked_send)
+        except RequestBodyTooLarge:
+            if not response_started:
+                await self._reject(scope, receive, send)
+
+    @staticmethod
+    async def _reject(scope, receive, send):
+        response = JSONResponse(
+            status_code=413,
+            content={
+                "error": {
+                    "code": "file_too_large",
+                    "message": "The upload exceeds the configured request size limit.",
+                }
+            },
+        )
+        await response(scope, receive, send)
 
 
 _analysis_cache: OrderedDict[str, tuple[float, dict[str, object]]] = OrderedDict()
@@ -224,13 +297,10 @@ def _analyze_frame(
                     )
             else:
                 nonempty = series.dropna().astype(str)
-                top_values = nonempty.value_counts().head(5)
+                top_value_counts = nonempty.value_counts().head(5)
                 categorical_summaries[name] = CategoricalSummary(
                     unique_count=int(nonempty.nunique()),
-                    top_values=[
-                        {"value": _clean_text(value), "count": int(count)}
-                        for value, count in top_values.items()
-                    ],
+                    top_value_counts=[int(count) for count in top_value_counts],
                 )
 
         columns.append(
@@ -387,12 +457,22 @@ async def _read_csv(upload: UploadFile) -> tuple[pd.DataFrame, str]:
         normalized_headers = [header.strip().casefold() for header in headers]
         if any(not header for header in normalized_headers):
             raise _error(400, "invalid_header", "Every CSV column must have a name.")
+        if any(
+            len(header) > 120
+            or any(ord(character) < 32 or ord(character) == 127 for character in header)
+            for header in headers
+        ):
+            raise _error(
+                400,
+                "invalid_header",
+                "Column names must be 120 characters or fewer and contain no control characters.",
+            )
         if len(set(normalized_headers)) != len(normalized_headers):
             raise _error(400, "duplicate_headers", "CSV column names must be unique.")
 
         frame = pd.read_csv(
             io.StringIO(text),
-            engine="python",
+            engine="c",
             on_bad_lines="error",
             nrows=MAX_ROWS + 1,
         )
@@ -425,9 +505,9 @@ def _generate_interpretation(evidence: dict[str, object]) -> Interpretation:
     if not api_key:
         raise RuntimeError("gemini_not_configured")
 
-    model = os.getenv("GEMINI_MODEL", "gemini-4-argon").strip()
-    if not model or len(model) > 100:
-        raise ValueError("Invalid GEMINI_MODEL configuration.")
+    model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-4-argon"
+    if len(model) > 100:
+        raise GeminiConfigurationError
 
     response_schema = {
         "type": "OBJECT",
@@ -515,10 +595,13 @@ app = FastAPI(
 origins = [
     origin.strip()
     for origin in os.getenv(
-        "FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+        "FRONTEND_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:5174,http://127.0.0.1:5174",
     ).split(",")
     if origin.strip()
 ]
+app.add_middleware(UploadSizeLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -535,12 +618,23 @@ async def http_exception_handler(_, exc: HTTPException):
         payload = detail
     else:
         payload = {"code": "request_error", "message": str(detail)}
-    from fastapi.responses import JSONResponse
-
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": payload},
         headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_: Request, __: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "validation_error",
+                "message": "The request is missing required fields or contains invalid values.",
+            }
+        },
     )
 
 
@@ -592,6 +686,13 @@ async def interpret(request: InterpretRequest):
             available=False,
             status="unavailable",
             message="AI interpretation timed out. Your deterministic analysis is still available.",
+            processing_time_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+    except GeminiConfigurationError:
+        return InterpretResponse(
+            available=False,
+            status="unavailable",
+            message="Gemini configuration is invalid. Check GEMINI_MODEL; deterministic analysis is still available.",
             processing_time_ms=round((time.perf_counter() - started) * 1000, 2),
         )
     except (ValueError, json.JSONDecodeError) as exc:
